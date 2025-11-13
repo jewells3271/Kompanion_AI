@@ -8,6 +8,7 @@ from flask import Flask, jsonify, request, send_from_directory
 from flask_sqlalchemy import SQLAlchemy
 from flask_migrate import Migrate
 from flask_cors import CORS
+from cryptography.fernet import Fernet
 from duckduckgo_search import DDGS # type: ignore
 import zipfile
 import tempfile
@@ -27,6 +28,12 @@ from werkzeug.utils import secure_filename # Added for file uploads
 
 # Load environment variables from .env file for local development
 load_dotenv()
+
+# Encryption setup
+ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY")
+if not ENCRYPTION_KEY:
+    raise ValueError("ENCRYPTION_KEY environment variable is not set.")
+cipher_suite = Fernet(ENCRYPTION_KEY.encode())
 
 
 
@@ -48,11 +55,41 @@ class User(db.Model):
     kompanion_ai_name = db.Column(db.String(80), nullable=False, default="KompanionAI")
     notification_email = db.Column(db.String(120), nullable=True)
 
+    # SMTP settings
+    smtp_server = db.Column(db.String(120), nullable=True)
+    smtp_port = db.Column(db.Integer, nullable=True)
+    smtp_user = db.Column(db.String(120), nullable=True)
+    encrypted_smtp_password = db.Column(db.String(256), nullable=True)
+
+    # IMAP settings
+    imap_server = db.Column(db.String(120), nullable=True)
+    imap_port = db.Column(db.Integer, nullable=True)
+    imap_user = db.Column(db.String(120), nullable=True)
+    encrypted_imap_password = db.Column(db.String(256), nullable=True)
+
     def set_password(self, password):
         self.password_hash = generate_password_hash(password)
 
     def check_password(self, password):
         return check_password_hash(self.password_hash, password)
+
+    def set_smtp_password(self, password):
+        if password:
+            self.encrypted_smtp_password = cipher_suite.encrypt(password.encode()).decode()
+
+    def get_smtp_password(self):
+        if self.encrypted_smtp_password:
+            return cipher_suite.decrypt(self.encrypted_smtp_password.encode()).decode()
+        return None
+
+    def set_imap_password(self, password):
+        if password:
+            self.encrypted_imap_password = cipher_suite.encrypt(password.encode()).decode()
+
+    def get_imap_password(self):
+        if self.encrypted_imap_password:
+            return cipher_suite.decrypt(self.encrypted_imap_password.encode()).decode()
+        return None
 
     def __repr__(self):
         return f'<User {self.username}>'
@@ -502,34 +539,33 @@ def send_email(user):
     to_email = data.get("to")
     subject = data.get("subject")
     body = data.get("body")
-    
+
     if not all([to_email, subject, body]):
         return jsonify({"error": "To, subject, and body are required"}), 400
-    
+
+    if not all([user.smtp_server, user.smtp_port, user.smtp_user, user.encrypted_smtp_password]):
+        return jsonify({"error": "SMTP settings are not configured for this user"}), 400
+
     try:
-        smtp_config = {
-            "smtp_server": os.getenv("SMTP_SERVER", "smtp.hostinger.com"),
-            "smtp_port": int(os.getenv("SMTP_PORT", 465)),
-            "smtp_user": os.getenv("SMTP_USER", ""),
-            "smtp_password": os.getenv("SMTP_PASS", ""),
-            "sent_from_email": os.getenv("SMTP_USER", "bot@example.com")
-        }
-        
+        smtp_password = user.get_smtp_password()
+        if not smtp_password:
+            return jsonify({"error": "Could not decrypt SMTP password"}), 500
+
         msg = MIMEText(body)
         msg["Subject"] = subject
-        msg["From"] = smtp_config["sent_from_email"]
+        msg["From"] = user.smtp_user
         msg["To"] = to_email
-        
-        with smtplib.SMTP_SSL(smtp_config["smtp_server"], smtp_config["smtp_port"]) as server:
-            server.login(smtp_config["smtp_user"], smtp_config["smtp_password"])
-            server.sendmail(smtp_config["sent_from_email"], to_email, msg.as_string())
-        
+
+        with smtplib.SMTP_SSL(user.smtp_server, user.smtp_port) as server:
+            server.login(user.smtp_user, smtp_password)
+            server.sendmail(user.smtp_user, to_email, msg.as_string())
+
         save_experience(user.id, f"Sent email to {to_email}: {subject}", {"type": "email", "to": to_email, "subject": subject})
-        
-        logging.info(f"Email sent from {smtp_config['sent_from_email']} to {to_email} for user {user.id}")
+
+        logging.info(f"Email sent from {user.smtp_user} to {to_email} for user {user.id}")
         return jsonify({
             "status": "success",
-            "from": smtp_config["sent_from_email"],
+            "from": user.smtp_user,
             "to": to_email,
             "subject": subject,
             "timestamp": datetime.now(timezone.utc).isoformat()
@@ -545,17 +581,17 @@ def check_email(user):
     limit = int(request.args.get("limit", 10))
     if limit > 50:
         limit = 50
-    
+
+    if not all([user.imap_server, user.imap_port, user.imap_user, user.encrypted_imap_password]):
+        return jsonify({"error": "IMAP settings are not configured for this user"}), 400
+
     try:
-        imap_config = {
-            "imap_server": os.getenv("IMAP_SERVER", "imap.hostinger.com"),
-            "imap_port": int(os.getenv("IMAP_PORT", 993)),
-            "imap_user": os.getenv("IMAP_USER", ""),
-            "imap_password": os.getenv("IMAP_PASS", "")
-        }
-        
-        with imaplib.IMAP4_SSL(imap_config["imap_server"], imap_config["imap_port"]) as server:
-            server.login(imap_config["imap_user"], imap_config["imap_password"])
+        imap_password = user.get_imap_password()
+        if not imap_password:
+            return jsonify({"error": "Could not decrypt IMAP password"}), 500
+
+        with imaplib.IMAP4_SSL(user.imap_server, user.imap_port) as server:
+            server.login(user.imap_user, imap_password)
             server.select(mailbox)
             _, message_numbers = server.search(None, "ALL")
             emails = []
@@ -575,12 +611,12 @@ def check_email(user):
                     "snippet": body_snippet
                 })
             server.logout()
-        
+
         logging.info(f"Checked {len(emails)} emails for user {user.id}")
         return jsonify({
             "status": "success",
             "emails": emails,
-            "account": imap_config["imap_user"],
+            "account": user.imap_user,
             "count": len(emails)
         })
     except Exception as e:
@@ -726,13 +762,32 @@ def get_settings(user):
 @jwt_required_wrapper
 def update_settings(user):
     data = request.get_json()
-    kompanion_ai_name = data.get("kompanion_ai_name")
-    notification_email = data.get("notification_email")
+    
+    # Update general settings
+    if "kompanion_ai_name" in data:
+        user.kompanion_ai_name = data["kompanion_ai_name"]
+    if "notification_email" in data:
+        user.notification_email = data["notification_email"]
 
-    if kompanion_ai_name:
-        user.kompanion_ai_name = kompanion_ai_name
-    if notification_email:
-        user.notification_email = notification_email
+    # Update SMTP settings
+    if "smtp_server" in data:
+        user.smtp_server = data["smtp_server"]
+    if "smtp_port" in data:
+        user.smtp_port = data["smtp_port"]
+    if "smtp_user" in data:
+        user.smtp_user = data["smtp_user"]
+    if "smtp_password" in data and data["smtp_password"]:
+        user.set_smtp_password(data["smtp_password"])
+
+    # Update IMAP settings
+    if "imap_server" in data:
+        user.imap_server = data["imap_server"]
+    if "imap_port" in data:
+        user.imap_port = data["imap_port"]
+    if "imap_user" in data:
+        user.imap_user = data["imap_user"]
+    if "imap_password" in data and data["imap_password"]:
+        user.set_imap_password(data["imap_password"])
     
     db.session.commit()
     return jsonify({"message": "Settings updated successfully"}), 200
